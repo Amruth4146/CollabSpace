@@ -20,7 +20,8 @@
     "test:unit": "vitest run",
     "test:e2e:pw": "playwright test",
     "test": "npm run test:unit && npm run test:auth && npm run test:registration && npm run test:e2e && npm run test:workspace && npm run test:editor && npm run test:collab && npm run test:history && npm run test:redis && npm run test:e2e:pw",
-    "collab": "npx tsx --env-file=.env server/collab-server.ts"
+    "collab": "npx tsx --env-file=.env server/collab-server.ts",
+    "start:collab": "tsx server/collab-server.ts"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.10.1",
@@ -43,6 +44,7 @@
     "pg": "^8.23.1",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "tsx": "^4.23.15",
     "ws": "^8.22.0",
     "y-protocols": "^1.0.7",
     "y-websocket": "^3.1.0",

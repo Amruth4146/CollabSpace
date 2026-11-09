@@ -13,6 +13,7 @@
  * 7. Redis PubSub coordination for seamless multi-instance scaling.
  */
 
+import 'dotenv/config';
 import http from 'http';
 import { URL } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -116,6 +117,14 @@ function initRedis() {
   try {
     redisPub = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 1 });
     redisSub = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 1 });
+
+    redisPub.on('error', (err) => {
+      console.warn('[CollabServer] Redis Pub connection notice:', err.message);
+    });
+
+    redisSub.on('error', (err) => {
+      console.warn('[CollabServer] Redis Sub connection notice:', err.message);
+    });
 
     redisPub.connect().catch((err) => {
       console.warn('[CollabServer] Redis Pub connection bypassed:', err.message);
@@ -795,7 +804,10 @@ export function createCollabServer(server?: http.Server, customInstanceId?: stri
 
 // Standalone runner execution entrypoint
 if (require.main === module) {
-  const port = parseInt(process.env.COLLAB_PORT || '1234', 10);
+  const port = parseInt(process.env.PORT || process.env.COLLAB_PORT || '1234', 10);
+  const isProduction = process.env.NODE_ENV === 'production' || !!process.env.PORT;
+  const host = isProduction ? '0.0.0.0' : 'localhost';
+
   const server = http.createServer((req, res) => {
     if (req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -808,8 +820,8 @@ if (require.main === module) {
 
   const { close } = createCollabServer(server);
 
-  server.listen(port, () => {
-    console.log(`[CollabServer] Real-time collaboration service listening on ws://localhost:${port}`);
+  server.listen(port, host, () => {
+    console.log(`[CollabServer] Real-time collaboration service listening on ws://${host}:${port}`);
   });
 
   // Safe process shutdown handling
