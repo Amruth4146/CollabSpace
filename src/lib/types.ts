@@ -42,6 +42,14 @@ export interface DocumentItem {
   isArchived?: boolean;
   isDeleted?: boolean;
   deletedAt?: string;
+  workspaceId?: string;
+  workspace?: {
+    id: string;
+    name: string;
+    slug?: string;
+    icon?: string;
+    ownerId?: string;
+  };
 }
 
 export interface CommentReply {

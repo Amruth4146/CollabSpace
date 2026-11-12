@@ -35,7 +35,21 @@ export async function GET(
           select: { id: true, name: true, email: true, avatar: true },
         },
         workspace: {
-          select: { id: true, name: true, slug: true, icon: true },
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            icon: true,
+            ownerId: true,
+            members: {
+              include: {
+                user: {
+                  select: { id: true, name: true, email: true, avatar: true },
+                },
+              },
+              orderBy: { joinedAt: 'asc' },
+            },
+          },
         },
       },
     });
@@ -43,6 +57,30 @@ export async function GET(
     if (!fullDoc) {
       return NextResponse.json({ error: 'Document not found.' }, { status: 404 });
     }
+
+    const PALETTE = ['#6366F1', '#8B5CF6', '#EC4899', '#3B82F6', '#10B981', '#F59E0B', '#06B6D4'];
+    const getColor = (str: string) => {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) hash = (hash << 5) - hash + str.charCodeAt(i);
+      return PALETTE[Math.abs(hash) % PALETTE.length];
+    };
+
+    const authorMember = fullDoc.workspace.members.find((m) => m.userId === fullDoc.author.id);
+    const authorRole = fullDoc.author.id === fullDoc.workspace.ownerId
+      ? 'owner'
+      : (authorMember?.role as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer') || 'editor';
+
+    const collaborators = fullDoc.workspace.members
+      .filter((m) => m.userId !== fullDoc.author.id)
+      .map((m) => ({
+        id: m.user.id,
+        name: m.user.name,
+        email: m.user.email,
+        avatar: m.user.avatar || '',
+        role: m.role as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer',
+        color: getColor(m.user.id),
+        status: 'online' as const,
+      }));
 
     return NextResponse.json({
       document: {
@@ -52,7 +90,13 @@ export async function GET(
         excerpt: fullDoc.excerpt || '',
         content: fullDoc.content,
         workspaceId: fullDoc.workspaceId,
-        workspace: fullDoc.workspace,
+        workspace: {
+          id: fullDoc.workspace.id,
+          name: fullDoc.workspace.name,
+          slug: fullDoc.workspace.slug,
+          icon: fullDoc.workspace.icon,
+          ownerId: fullDoc.workspace.ownerId,
+        },
         isStarred: fullDoc.isStarred,
         isDeleted: fullDoc.isDeleted,
         deletedAt: fullDoc.deletedAt?.toISOString(),
@@ -66,11 +110,11 @@ export async function GET(
           name: fullDoc.author.name,
           email: fullDoc.author.email,
           avatar: fullDoc.author.avatar || '',
-          role: 'editor',
-          color: '#6366F1',
+          role: authorRole,
+          color: getColor(fullDoc.author.id),
           status: 'online',
         },
-        collaborators: [],
+        collaborators,
       },
       userRole,
       permissions,

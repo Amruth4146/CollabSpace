@@ -1,4 +1,5 @@
 'use client';
+/* eslint-disable @next/next/no-img-element */
 
 import React, { useState } from 'react';
 import { Modal } from '../ui/modal';
@@ -11,7 +12,22 @@ interface ShareModalProps {
   onClose: () => void;
   documentTitle: string;
   collaborators: User[];
-  onInvite: (email: string, role: string) => void;
+  onInvite: (email: string, role: string) => Promise<void> | void;
+  workspaceName?: string;
+  owner?: {
+    id?: string;
+    name: string;
+    email: string;
+    avatar?: string;
+    role?: string;
+  };
+  currentUser?: {
+    id?: string;
+    name: string;
+    email: string;
+    avatar?: string;
+  };
+  isInviting?: boolean;
 }
 
 export function ShareModal({
@@ -20,6 +36,10 @@ export function ShareModal({
   documentTitle,
   collaborators,
   onInvite,
+  workspaceName = 'CollabSpace Workspace',
+  owner,
+  currentUser,
+  isInviting = false,
 }: ShareModalProps) {
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<'editor' | 'commenter' | 'viewer'>('editor');
@@ -34,10 +54,11 @@ export function ShareModal({
     }
   };
 
-  const handleInviteSubmit = (e: React.FormEvent) => {
+  const handleInviteSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inviteEmail.trim() || !inviteEmail.includes('@')) return;
-    onInvite(inviteEmail.trim(), inviteRole);
+    if (!inviteEmail.trim() || !inviteEmail.includes('@') || isInviting) return;
+    const emailToInvite = inviteEmail.trim();
+    await onInvite(emailToInvite, inviteRole);
     setInviteEmail('');
   };
 
@@ -56,20 +77,28 @@ export function ShareModal({
             type="email"
             value={inviteEmail}
             onChange={(e) => setInviteEmail(e.target.value)}
+            disabled={isInviting}
             placeholder="colleague@company.com"
-            className="flex-1 rounded-xl border border-slate-300 px-3.5 py-2 text-xs text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            className="flex-1 rounded-xl border border-slate-300 px-3.5 py-2 text-xs text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 disabled:bg-slate-50 disabled:cursor-not-allowed"
           />
           <select
             value={inviteRole}
             onChange={(e) => setInviteRole(e.target.value as 'editor' | 'commenter' | 'viewer')}
-            className="rounded-xl border border-slate-300 px-3 py-2 text-xs text-slate-700 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            disabled={isInviting}
+            className="rounded-xl border border-slate-300 px-3 py-2 text-xs text-slate-700 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 disabled:bg-slate-50 disabled:cursor-not-allowed"
           >
             <option value="editor">Can edit</option>
             <option value="commenter">Can comment</option>
             <option value="viewer">Can view</option>
           </select>
-          <Button type="submit" variant="primary" size="sm" disabled={!inviteEmail.trim()}>
-            Invite
+          <Button
+            type="submit"
+            variant="primary"
+            size="sm"
+            disabled={!inviteEmail.trim() || isInviting}
+            isLoading={isInviting}
+          >
+            {isInviting ? 'Inviting...' : 'Invite'}
           </Button>
         </form>
 
@@ -80,9 +109,9 @@ export function ShareModal({
               <UsersIcon className="w-4 h-4" />
             </div>
             <div className="min-w-0 text-xs">
-              <p className="font-semibold text-slate-800">
+              <p className="font-semibold text-slate-800 truncate">
                 {permissionType === 'workspace'
-                  ? 'Anyone in Acme Product Team with link'
+                  ? `Anyone in ${workspaceName} with link`
                   : 'Public access enabled'}
               </p>
               <p className="text-[11px] text-slate-500">
@@ -115,45 +144,95 @@ export function ShareModal({
         {/* Existing People with Access */}
         <div className="space-y-2">
           <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-            People with access ({collaborators.length + 1})
+            People with access ({(owner ? 1 : 0) + collaborators.length})
           </h4>
           <div className="divide-y divide-slate-100 max-h-48 overflow-y-auto pr-1">
-            {/* Current User */}
-            <div className="py-2 flex items-center justify-between text-xs">
-              <div className="flex items-center gap-2.5">
-                <div className="w-7 h-7 rounded-full bg-indigo-600 text-white font-bold text-xs flex items-center justify-center">
-                  AR
-                </div>
-                <div>
-                  <p className="font-semibold text-slate-900">Alex Rivera (You)</p>
-                  <p className="text-[11px] text-slate-400">alex.rivera@collabspace.dev</p>
-                </div>
-              </div>
-              <span className="text-[11px] font-semibold text-slate-500 bg-slate-100 px-2 py-0.5 rounded">
-                Owner
-              </span>
-            </div>
-
-            {/* Collaborators */}
-            {collaborators.map((c) => (
-              <div key={c.id} className="py-2 flex items-center justify-between text-xs">
-                <div className="flex items-center gap-2.5">
-                  <div
-                    className="w-7 h-7 rounded-full text-white font-bold text-xs flex items-center justify-center"
-                    style={{ backgroundColor: c.color }}
-                  >
-                    {c.name[0]}
+            {/* Owner Row */}
+            {owner && (
+              <div className="py-2 flex items-center justify-between text-xs">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  {owner.avatar ? (
+                    <img
+                      src={owner.avatar}
+                      alt={owner.name}
+                      className="w-7 h-7 rounded-full object-cover ring-1 ring-slate-200 shrink-0"
+                    />
+                  ) : (
+                    <div className="w-7 h-7 rounded-full bg-indigo-600 text-white font-bold text-xs flex items-center justify-center shrink-0">
+                      {owner.name
+                        ? owner.name
+                            .split(' ')
+                            .map((n) => n[0])
+                            .join('')
+                            .slice(0, 2)
+                            .toUpperCase()
+                        : 'OW'}
+                    </div>
+                  )}
+                  <div className="min-w-0">
+                    <p className="font-semibold text-slate-900 truncate">
+                      {owner.name}
+                      {currentUser &&
+                      (currentUser.id === owner.id ||
+                        (currentUser.email &&
+                          owner.email &&
+                          currentUser.email.toLowerCase() === owner.email.toLowerCase()))
+                        ? ' (You)'
+                        : ''}
+                    </p>
+                    <p className="text-[11px] text-slate-400 truncate">{owner.email}</p>
                   </div>
-                  <div>
-                    <p className="font-semibold text-slate-800">{c.name}</p>
-                    <p className="text-[11px] text-slate-400">{c.email}</p>
-                  </div>
                 </div>
-                <span className="text-[11px] text-slate-600 capitalize bg-slate-50 border border-slate-200 px-2 py-0.5 rounded">
-                  {c.role}
+                <span className="text-[11px] font-semibold text-slate-500 bg-slate-100 px-2 py-0.5 rounded capitalize shrink-0 ml-2">
+                  {owner.role || 'Owner'}
                 </span>
               </div>
-            ))}
+            )}
+
+            {/* Collaborators */}
+            {collaborators.map((c) => {
+              const isYou = Boolean(
+                currentUser &&
+                  (currentUser.id === c.id ||
+                    (currentUser.email &&
+                      c.email &&
+                      currentUser.email.toLowerCase() === c.email.toLowerCase()))
+              );
+              return (
+                <div key={c.id || c.email} className="py-2 flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    {c.avatar ? (
+                      <img
+                        src={c.avatar}
+                        alt={c.name}
+                        className="w-7 h-7 rounded-full object-cover ring-1 ring-slate-200 shrink-0"
+                      />
+                    ) : (
+                      <div
+                        className="w-7 h-7 rounded-full text-white font-bold text-xs flex items-center justify-center shrink-0"
+                        style={{ backgroundColor: c.color || '#6366F1' }}
+                      >
+                        {c.name ? c.name[0].toUpperCase() : 'U'}
+                      </div>
+                    )}
+                    <div className="min-w-0">
+                      <p className="font-semibold text-slate-800 truncate">
+                        {c.name}
+                        {isYou ? ' (You)' : ''}
+                      </p>
+                      <p className="text-[11px] text-slate-400 truncate">{c.email}</p>
+                    </div>
+                  </div>
+                  <span className="text-[11px] text-slate-600 capitalize bg-slate-50 border border-slate-200 px-2 py-0.5 rounded shrink-0 ml-2">
+                    {c.role}
+                  </span>
+                </div>
+              );
+            })}
+
+            {!owner && collaborators.length === 0 && (
+              <p className="py-2 text-[11px] text-slate-400 italic">No team members with access yet.</p>
+            )}
           </div>
         </div>
 

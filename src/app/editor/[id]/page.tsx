@@ -48,7 +48,9 @@ function DocumentEditorContent() {
   const [activeQuote, setActiveQuote] = useState<string | null>(null);
   const [versions, setVersions] = useState<VersionEntry[]>(MOCK_VERSIONS);
   const [isLoadingVersions, setIsLoadingVersions] = useState(false);
-  const [collaborators, setCollaborators] = useState<User[]>(MOCK_COLLABORATORS);
+  const [collaborators, setCollaborators] = useState<User[]>([]);
+  const [activeCollaborators, setActiveCollaborators] = useState<User[]>([]);
+  const [isInviting, setIsInviting] = useState(false);
   const [collabToken, setCollabToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<User>(CURRENT_USER);
   const [collabStatus, setCollabStatus] = useState<'connected' | 'connecting' | 'disconnected'>('connecting');
@@ -108,6 +110,7 @@ function DocumentEditorContent() {
           setContent(demoDoc.content);
           setWorkspaceName('Acme Product Team');
           setUserRole('editor');
+          setCollaborators(MOCK_COLLABORATORS);
           setIsLoading(false);
         }
         return;
@@ -143,6 +146,9 @@ function DocumentEditorContent() {
           setContent(data.document.content);
           if (data.document.workspace?.name) {
             setWorkspaceName(data.document.workspace.name);
+          }
+          if (data.document.collaborators) {
+            setCollaborators(data.document.collaborators);
           }
           if (data.userRole) {
             setUserRole(data.userRole);
@@ -282,7 +288,7 @@ function DocumentEditorContent() {
 
   // Stabilized callbacks for TipTapEditor to prevent unnecessary provider teardown
   const handleCollaboratorsChange = useCallback((activeUsers: User[]) => {
-    setCollaborators(activeUsers);
+    setActiveCollaborators(activeUsers);
   }, []);
 
   const handleConnectionStatusChange = useCallback((status: 'connected' | 'connecting' | 'disconnected') => {
@@ -569,18 +575,99 @@ function DocumentEditorContent() {
   };
 
   // Invite Collaborator
-  const handleInviteCollaborator = (email: string, role: string) => {
-    const newUser: User = {
-      id: `usr-${Date.now()}`,
-      name: email.split('@')[0],
-      email,
-      avatar: '',
-      role: role as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer',
-      color: '#8B5CF6',
-      status: 'online',
-    };
-    setCollaborators((prev) => [...prev, newUser]);
-    success(`Invite sent to ${email} as ${role}.`);
+  const handleInviteCollaborator = async (email: string, role: string) => {
+    const workspaceId = documentData?.workspaceId;
+    if (!workspaceId || docId?.startsWith('doc-') || docId === 'demo') {
+      const newUser: User = {
+        id: `usr-${Date.now()}`,
+        name: email.split('@')[0],
+        email,
+        avatar: '',
+        role: role as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer',
+        color: '#8B5CF6',
+        status: 'online',
+      };
+      setCollaborators((prev) => [...prev, newUser]);
+      success(`Invite sent to ${email} as ${role}.`);
+      return;
+    }
+
+    setIsInviting(true);
+    try {
+      const res = await fetch(`/api/workspaces/${workspaceId}/members`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, role }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        if (res.status === 409) {
+          toast({
+            title: data.error || 'User is already a member of this workspace.',
+            variant: 'error',
+          });
+          return;
+        }
+        toast({
+          title: data.error || 'Failed to send invitation.',
+          variant: 'error',
+        });
+        return;
+      }
+
+      // Member successfully added to PostgreSQL
+      if (data.member?.user) {
+        const newCollaborator: User = {
+          id: data.member.user.id,
+          name: data.member.user.name,
+          email: data.member.user.email,
+          avatar: data.member.user.avatar || '',
+          role: (data.member.role || role) as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer',
+          color: data.member.user.color || '#6366F1',
+          status: 'online',
+        };
+        setCollaborators((prev) => {
+          const exists = prev.some(
+            (c) => c.id === newCollaborator.id || c.email.toLowerCase() === newCollaborator.email.toLowerCase()
+          );
+          if (exists) return prev;
+          return [...prev, newCollaborator];
+        });
+      } else {
+        // Fallback: refresh workspace members
+        try {
+          const membersRes = await fetch(`/api/workspaces/${workspaceId}/members`);
+          if (membersRes.ok) {
+            const membersData = await membersRes.json();
+            if (membersData.members) {
+              const updated = membersData.members
+                .filter((m: { user: { id: string } }) => m.user.id !== documentData.author?.id)
+                .map((m: { user: { id: string; name: string; email: string; avatar?: string }; role: string }) => ({
+                  id: m.user.id,
+                  name: m.user.name,
+                  email: m.user.email,
+                  avatar: m.user.avatar || '',
+                  role: m.role as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer',
+                  color: '#6366F1',
+                  status: 'online' as const,
+                }));
+              setCollaborators(updated);
+            }
+          }
+        } catch {
+          // ignore refresh error
+        }
+      }
+
+      success(`Invite sent to ${email} as ${role}.`);
+    } catch (err) {
+      console.error('Failed to invite collaborator:', err);
+      toast({ title: 'Network error sending invitation.', variant: 'error' });
+    } finally {
+      setIsInviting(false);
+    }
   };
 
   // Access Denied / 403 / 404 Error State
@@ -647,7 +734,7 @@ function DocumentEditorContent() {
         onTitleChange={handleTitleChange}
         icon={documentData.icon}
         isSaving={isSaving}
-        collaborators={collaborators}
+        collaborators={activeCollaborators.length > 0 ? activeCollaborators : (collaborators.length > 0 ? collaborators : [currentUser])}
         collabStatus={collabStatus}
         onOpenShare={() => setIsShareModalOpen(true)}
         commentsCount={comments.filter((c) => !c.resolved).length}
@@ -720,6 +807,10 @@ function DocumentEditorContent() {
         documentTitle={title}
         collaborators={collaborators}
         onInvite={handleInviteCollaborator}
+        workspaceName={workspaceName}
+        owner={documentData?.author || currentUser}
+        currentUser={currentUser}
+        isInviting={isInviting}
       />
 
       {/* Shortcuts Modal */}
