@@ -14,6 +14,7 @@ import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
+import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 
 import { EditorToolbar } from './editor-toolbar';
@@ -465,9 +466,129 @@ interface CollabSession {
   peers: Array<{ id: string; name: string; color: string; isSelf: boolean }>;
   users: User[];
   listeners: Set<() => void>;
+  ticket: string | null;
+  refreshTimer: NodeJS.Timeout | null;
+  refreshAbortController: AbortController | null;
+  isRefreshing: boolean;
+  isDestroyed: boolean;
 }
 
 const collabSessionStore = new Map<string, CollabSession>();
+const messageAuth = 2;
+
+/**
+ * Safely refreshes the short-lived collaboration ticket via HTTP POST.
+ * Guarantees:
+ * - Single in-flight request deduplication.
+ * - Format and structure validation before usage.
+ * - In-band reauthorization over WebSocket if connected.
+ * - Graceful retry with bounded backoff.
+ * - Safe handling of component unmount and destroyed sessions.
+ */
+async function refreshCollabTicket(
+  session: CollabSession,
+  docId: string
+): Promise<string | null> {
+  if (session.isDestroyed || session.isRefreshing) {
+    return null;
+  }
+  session.isRefreshing = true;
+
+  if (session.refreshAbortController) {
+    session.refreshAbortController.abort();
+  }
+  const abortCtrl = new AbortController();
+  session.refreshAbortController = abortCtrl;
+
+  try {
+    let attempts = 0;
+    const maxAttempts = 2;
+
+    while (attempts <= maxAttempts && !session.isDestroyed) {
+      try {
+        const res = await fetch(`/api/documents/${encodeURIComponent(docId)}/collab-token`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          credentials: 'include',
+          signal: abortCtrl.signal,
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          const newTicket = data.ticket || data.collabToken;
+
+          // Validate returned ticket format: string, non-empty, two base64url parts
+          if (
+            typeof newTicket === 'string' &&
+            newTicket.length > 20 &&
+            newTicket.split('.').length === 2
+          ) {
+            if (!session.isDestroyed) {
+              session.ticket = newTicket;
+
+              // Reauthorize existing connection in-band if WebSocket is currently open
+              const ws = session.provider.ws;
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                try {
+                  const encoder = encoding.createEncoder();
+                  encoding.writeVarUint(encoder, messageAuth);
+                  encoding.writeVarString(encoder, newTicket);
+                  ws.send(encoding.toUint8Array(encoder));
+                } catch (sendErr) {
+                  console.warn('[Collab] Failed to transmit refreshed ticket in-band:', sendErr);
+                }
+              }
+              return newTicket;
+            }
+          }
+        }
+      } catch (err: unknown) {
+        if ((err as Error)?.name === 'AbortError') {
+          return null;
+        }
+      }
+
+      attempts++;
+      if (attempts <= maxAttempts && !session.isDestroyed) {
+        await new Promise((resolve) => setTimeout(resolve, 2500 * attempts));
+      }
+    }
+  } finally {
+    session.isRefreshing = false;
+  }
+  return null;
+}
+
+/**
+ * Creates a specialized WebSocket subclass that securely transmits the short-lived,
+ * document-scoped HMAC-SHA256 authentication ticket as the first packet on open.
+ * Eliminates long-lived bearer tokens from the WebSocket URL query string.
+ */
+function createAuthWebSocketClass(getTicket: () => string | null) {
+  const BaseWebSocket = typeof window !== 'undefined' ? window.WebSocket : WebSocket;
+  return class AuthWebSocket extends BaseWebSocket {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      super(url, protocols);
+
+      // Transmit signed HMAC-SHA256 authentication ticket as the first packet on open
+      this.addEventListener('open', () => {
+        const ticket = getTicket();
+        if (ticket) {
+          try {
+            const encoder = encoding.createEncoder();
+            encoding.writeVarUint(encoder, messageAuth);
+            encoding.writeVarString(encoder, ticket);
+            this.send(encoding.toUint8Array(encoder));
+          } catch (err) {
+            console.error('[Collab] Failed to transmit WebSocket auth ticket:', err);
+          }
+        }
+      });
+    }
+  };
+}
 
 function getOrCreateCollabSession(
   wsUrl: string,
@@ -481,50 +602,71 @@ function getOrCreateCollabSession(
     return null;
   }
 
-  const key = `${wsUrl}:${docId}:${sessionToken || 'none'}`;
+  const key = `${wsUrl}:${docId}`;
   let session = collabSessionStore.get(key);
 
-  if (!session) {
-    const ydoc = new Y.Doc();
-    const tokenParams: Record<string, string> = {};
-    if (sessionToken) {
-      tokenParams.token = sessionToken;
+  if (session) {
+    if (sessionToken && sessionToken !== session.ticket) {
+      session.ticket = sessionToken;
     }
+    if (session.destroyTimer) {
+      clearTimeout(session.destroyTimer);
+      session.destroyTimer = null;
+    }
+    return session;
+  }
 
-    const provider = new WebsocketProvider(wsUrl, docId, ydoc, {
-      params: Object.keys(tokenParams).length > 0 ? tokenParams : undefined,
-      disableBc: true,
-    });
+  const ydoc = new Y.Doc();
+  const AuthWS = createAuthWebSocketClass(() => session?.ticket || sessionToken || null);
 
-    const messageComment = 3;
-    provider.messageHandlers[messageComment] = (
-      _encoder,
-      decoder
-    ) => {
-      try {
-        const rawJson = decoding.readVarString(decoder);
-        const data = JSON.parse(rawJson);
-        if (typeof window !== 'undefined') {
-          window.dispatchEvent(
-            new CustomEvent('collabspace:comment_update', { detail: data })
-          );
-        }
-      } catch (err) {
-        console.warn('[Collab] Failed to parse comment packet:', err);
+  const provider = new WebsocketProvider(wsUrl, docId, ydoc, {
+    WebSocketPolyfill: AuthWS as unknown as typeof WebSocket,
+    disableBc: true,
+  });
+
+  const messageComment = 3;
+  provider.messageHandlers[messageComment] = (
+    _encoder,
+    decoder
+  ) => {
+    try {
+      const rawJson = decoding.readVarString(decoder);
+      const data = JSON.parse(rawJson);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('collabspace:comment_update', { detail: data })
+        );
       }
-    };
+    } catch (err) {
+      console.warn('[Collab] Failed to parse comment packet:', err);
+    }
+  };
 
-    session = {
-      key,
-      ydoc,
-      provider,
-      refCount: 0,
-      destroyTimer: null,
-      status: 'connecting',
-      peers: [],
-      users: [],
-      listeners: new Set(),
-    };
+  session = {
+    key,
+    ydoc,
+    provider,
+    refCount: 0,
+    destroyTimer: null,
+    status: 'connecting',
+    peers: [],
+    users: [],
+    listeners: new Set(),
+    ticket: sessionToken,
+    refreshTimer: null,
+    refreshAbortController: null,
+    isRefreshing: false,
+    isDestroyed: false,
+  };
+
+  // Background ticket refresh every 45s for long collaborative sessions
+  if (!isDemo) {
+    session.refreshTimer = setInterval(() => {
+      if (session && !session.isDestroyed) {
+        refreshCollabTicket(session, docId).catch(() => {});
+      }
+    }, 45000);
+  }
 
     const notify = () => {
       session!.listeners.forEach((listener) => listener());
@@ -570,12 +712,7 @@ function getOrCreateCollabSession(
     });
 
     collabSessionStore.set(key, session);
-  } else if (session.destroyTimer) {
-    clearTimeout(session.destroyTimer);
-    session.destroyTimer = null;
-  }
-
-  return session;
+    return session;
 }
 
 function releaseCollabSession(key: string) {
@@ -587,6 +724,15 @@ function releaseCollabSession(key: string) {
     if (session.destroyTimer) clearTimeout(session.destroyTimer);
     session.destroyTimer = setTimeout(() => {
       if (session.refCount <= 0) {
+        session.isDestroyed = true;
+        if (session.refreshTimer) {
+          clearInterval(session.refreshTimer);
+          session.refreshTimer = null;
+        }
+        if (session.refreshAbortController) {
+          session.refreshAbortController.abort();
+          session.refreshAbortController = null;
+        }
         session.provider.destroy();
         session.ydoc.destroy();
         collabSessionStore.delete(key);
@@ -622,7 +768,7 @@ export function TipTapEditor({
     return 'ws://localhost:1234';
   }, []);
 
-  const sessionKey = `${wsUrl}:${activeDocId}:${sessionToken || 'none'}`;
+  const sessionKey = `${wsUrl}:${activeDocId}`;
 
   // Stable subscription to external collaboration session using React's useSyncExternalStore
   const subscribe = useCallback(

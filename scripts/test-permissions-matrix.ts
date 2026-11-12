@@ -266,7 +266,11 @@ async function runPermissionsMatrixTest() {
       headers: { Cookie: `collabspace_session=${commenterToken}` },
     });
     const commenterGetDocData = await commenterGetDocRes.json();
-    assert(commenterGetDocRes.status === 200, 'Commenter GET /api/documents/[id] returns 200 OK');
+    assert(
+      commenterGetDocRes.status === 200,
+      'Commenter GET /api/documents/[id] returns 200 OK',
+      `Got status ${commenterGetDocRes.status}: ${JSON.stringify(commenterGetDocData)}`
+    );
     assert(commenterGetDocData.userRole === 'commenter', 'Response returns userRole: "commenter"');
     assert(commenterGetDocData.permissions?.canView === true, 'Response permissions.canView is true');
     assert(commenterGetDocData.permissions?.canComment === true, 'Response permissions.canComment is true');
@@ -535,7 +539,7 @@ async function runPermissionsMatrixTest() {
   if (failedTests > 0) {
     process.exit(1);
   } else {
-    process.exit(0);
+    setTimeout(() => process.exit(0), 100);
   }
 }
 

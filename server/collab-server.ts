@@ -28,6 +28,7 @@ import { prisma } from '../src/lib/prisma';
 import { validateSessionToken } from '../src/lib/auth/session';
 import { verifyDocumentAccess, AuthError } from '../src/lib/auth/authorization';
 import { createDocumentSnapshot } from '../src/lib/snapshots';
+import { verifyCollabTicket } from '../src/lib/auth/collab-ticket';
 
 // Standard y-websocket wire protocol message codes + custom CollabSpace extensions
 const messageSync = 0;
@@ -42,6 +43,7 @@ const MAX_MESSAGE_SIZE = 5 * 1024 * 1024;
 export let INSTANCE_ID = Math.random().toString(36).substring(2, 10);
 
 interface ClientContext {
+  connectionId: string;
   docId: string;
   userId: string;
   userName: string;
@@ -53,7 +55,13 @@ interface ClientContext {
   isAlive: boolean;
   messageCount: number;
   messageWindowStart: number;
+  revalidationTimer?: NodeJS.Timeout | null;
+  isClosed?: boolean;
 }
+
+// Active connections registry across all collaborative rooms on this server instance
+export const activeConnections = new Set<WebSocket>();
+export const connectionContexts = new WeakMap<WebSocket, ClientContext>();
 
 export class WSSharedDoc extends Y.Doc {
   name: string;
@@ -112,11 +120,75 @@ export const docs = new Map<string, WSSharedDoc>();
 let redisPub: Redis | null = null;
 let redisSub: Redis | null = null;
 
+/**
+ * Handles real-time session or document permission revocation across active WebSocket connections.
+ * Closes unauthorized connections immediately and enforces read-only wire restrictions on demoted roles.
+ */
+export function handleRevocationEvent(data: {
+  action: 'revoke_user' | 'revoke_doc' | 'role_change' | 'revoke_session';
+  userId?: string;
+  docId?: string;
+  newRole?: 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer';
+}): void {
+  const { action, userId, docId, newRole } = data;
+
+  if (action === 'revoke_doc' && docId) {
+    const liveDoc = docs.get(docId);
+    if (liveDoc) {
+      liveDoc.conns.forEach((_, conn) => {
+        rejectConnection(conn, 4403, 'Document access revoked or document deleted');
+      });
+    }
+    return;
+  }
+
+  activeConnections.forEach((conn) => {
+    const ctx = connectionContexts.get(conn);
+    if (!ctx) return;
+
+    if (action === 'revoke_user' && userId && ctx.userId === userId) {
+      if (!docId || ctx.docId === docId) {
+        rejectConnection(conn, 4403, 'User access revoked');
+      }
+    } else if (action === 'role_change' && userId && ctx.userId === userId) {
+      if (!docId || ctx.docId === docId) {
+        if (newRole) {
+          ctx.role = newRole;
+          ctx.canWrite = newRole === 'owner' || newRole === 'admin' || newRole === 'editor';
+          if (!ctx.canWrite) {
+            const authEncoder = encoding.createEncoder();
+            encoding.writeVarUint(authEncoder, messageAuth);
+            authProtocol.writePermissionDenied(
+              authEncoder,
+              `Permission updated: role changed to ${newRole} (read-only)`
+            );
+            send(conn, encoding.toUint8Array(authEncoder));
+          }
+        }
+      }
+    } else if (action === 'revoke_session' && userId && ctx.userId === userId) {
+      rejectConnection(conn, 4401, 'User session revoked');
+    }
+  });
+}
+
 function initRedis() {
+  if (!process.env.REDIS_URL && process.env.NODE_ENV === 'production') {
+    console.log('[CollabServer] REDIS_URL not configured; running in standalone single-node mode.');
+    return;
+  }
+
   const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+  const isTls = redisUrl.startsWith('rediss://');
+  const redisOptions = {
+    lazyConnect: true,
+    maxRetriesPerRequest: 1,
+    ...(isTls ? { tls: {} } : {}),
+  };
+
   try {
-    redisPub = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 1 });
-    redisSub = new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 1 });
+    redisPub = new Redis(redisUrl, redisOptions);
+    redisSub = new Redis(redisUrl, redisOptions);
 
     redisPub.on('error', (err) => {
       console.warn('[CollabServer] Redis Pub connection notice:', err.message);
@@ -132,9 +204,21 @@ function initRedis() {
     });
 
     redisSub.connect().then(() => {
-      redisSub?.subscribe('collab:control', 'collab:comments').catch(() => {});
+      redisSub?.subscribe('collab:control', 'collab:comments', 'collab:revoke').catch(() => {});
       redisSub?.on('messageBuffer', async (channelBuffer, messageBuffer) => {
         const channel = channelBuffer.toString();
+
+        // Cross-instance real-time permission & session revocation channel
+        if (channel === 'collab:revoke') {
+          try {
+            const raw = messageBuffer.toString('utf-8');
+            const data = JSON.parse(raw);
+            handleRevocationEvent(data);
+          } catch (e) {
+            console.warn('[CollabServer] Error handling collab:revoke message:', e);
+          }
+          return;
+        }
 
         // Real-time comment event distribution channel
         if (channel === 'collab:comments') {
@@ -315,13 +399,18 @@ export async function persistDocument(doc: WSSharedDoc): Promise<void> {
       }
     }
 
-    // Check document exists in DB before updating
+    // Check document exists in DB before updating and is not soft-deleted
     const existing = await prisma.document.findUnique({
       where: { id: doc.name },
-      select: { id: true },
+      select: { id: true, isDeleted: true },
     });
-    if (!existing) {
+    if (!existing || existing.isDeleted) {
       doc.isDirty = false;
+      if (existing?.isDeleted) {
+        doc.conns.forEach((_, conn) => {
+          rejectConnection(conn, 4403, 'Document access revoked or document deleted');
+        });
+      }
       return;
     }
 
@@ -459,11 +548,14 @@ function rejectConnection(conn: WebSocket, code: number, reason: string) {
 }
 
 /**
- * Extracts session token from request query parameters or cookies.
+ * Extracts session or ticket token from request query parameters or cookies.
  */
 function extractAuthToken(req: http.IncomingMessage, parsedUrl: URL): string | null {
   // 1. From URL query parameter
-  const queryToken = parsedUrl.searchParams.get('token') || parsedUrl.searchParams.get('auth');
+  const queryToken =
+    parsedUrl.searchParams.get('ticket') ||
+    parsedUrl.searchParams.get('token') ||
+    parsedUrl.searchParams.get('auth');
   if (queryToken) return queryToken;
 
   // 2. From Cookie header
@@ -476,6 +568,138 @@ function extractAuthToken(req: http.IncomingMessage, parsedUrl: URL): string | n
   }
 
   return null;
+}
+
+/**
+ * Safely extracts an authentication ticket from an incoming message payload.
+ * Supports:
+ * 1. Binary messageAuth packet (message type 2) with string payload.
+ * 2. JSON text frame { type: "auth", ticket: "..." }.
+ */
+export function parseAuthPacket(data: unknown): string | null {
+  try {
+    if (typeof data === 'string') {
+      const p = JSON.parse(data);
+      return (
+        (typeof p.ticket === 'string' ? p.ticket : null) ||
+        (typeof p.token === 'string' ? p.token : null) ||
+        (typeof p.auth === 'string' ? p.auth : null)
+      );
+    }
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+    if (buf.length === 0) return null;
+
+    // Check if JSON text frame
+    if (buf[0] === 0x7b /* '{' */) {
+      const p = JSON.parse(buf.toString('utf-8'));
+      return (
+        (typeof p.ticket === 'string' ? p.ticket : null) ||
+        (typeof p.token === 'string' ? p.token : null) ||
+        (typeof p.auth === 'string' ? p.auth : null)
+      );
+    }
+
+    // Binary messageAuth protocol
+    const dec = decoding.createDecoder(new Uint8Array(buf));
+    const msgType = decoding.readVarUint(dec);
+    if (msgType === messageAuth) {
+      return decoding.readVarString(dec);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Authenticates a client using either:
+ * 1. Short-lived (60s), document-scoped HMAC-SHA256 ticket with atomic replay consumption (preferred & production mandatory).
+ * 2. Database session token (strictly restricted to non-production environments for test fixture compatibility).
+ */
+export async function authenticateClient(
+  tokenStr: string,
+  docId: string,
+  options?: { isRefresh?: boolean }
+): Promise<
+  | {
+      success: true;
+      user: { id: string; name: string; email: string };
+      role: string;
+      canWrite: boolean;
+    }
+  | { success: false; code: number; error: string }
+> {
+  const isRefresh = options?.isRefresh ?? false;
+
+  // 1. First attempt: Verify as a cryptographically signed HMAC-SHA256 Collab Ticket with atomic replay check
+  const ticketResult = await verifyCollabTicket(tokenStr, docId, {
+    consumeReplay: !isRefresh,
+    redisClient: redisPub,
+  });
+
+  if (ticketResult.valid) {
+    try {
+      const { userRole } = await verifyDocumentAccess(ticketResult.payload.userId, docId, 'viewer');
+      const canWrite = userRole === 'owner' || userRole === 'admin' || userRole === 'editor';
+
+      const user = await prisma.user.findUnique({
+        where: { id: ticketResult.payload.userId },
+        select: { id: true, name: true, email: true },
+      });
+
+      if (!user) {
+        return { success: false, code: 4401, error: 'User associated with ticket no longer exists' };
+      }
+
+      return {
+        success: true,
+        user,
+        role: userRole,
+        canWrite,
+      };
+    } catch (err) {
+      if (err instanceof AuthError) {
+        return { success: false, code: err.status === 404 ? 4404 : 4403, error: err.message };
+      }
+      return { success: false, code: 4500, error: 'Authorization verification failed' };
+    }
+  }
+
+  // If ticket format was provided (contains '.') and validation failed, strictly reject
+  if (tokenStr.includes('.') && !ticketResult.valid) {
+    return { success: false, code: ticketResult.code, error: ticketResult.error };
+  }
+
+  // STRICT PRODUCTION SECURITY: Reject raw session tokens as WebSocket credentials in production
+  if (process.env.NODE_ENV === 'production') {
+    return {
+      success: false,
+      code: 4401,
+      error: 'Unauthorized: Signed collaboration ticket required in production',
+    };
+  }
+
+  // 2. Fallback attempt: Session token validation (only in non-production environments for test fixtures)
+  const sessionUser = await validateSessionToken(tokenStr);
+  if (!sessionUser) {
+    return { success: false, code: 4401, error: ticketResult.error || 'Unauthorized: Invalid or expired session' };
+  }
+
+  try {
+    const { userRole } = await verifyDocumentAccess(sessionUser.id, docId, 'viewer');
+    const canWrite = userRole === 'owner' || userRole === 'admin' || userRole === 'editor';
+    return {
+      success: true,
+      user: sessionUser,
+      role: userRole,
+      canWrite,
+    };
+  } catch (err) {
+    if (err instanceof AuthError) {
+      return { success: false, code: err.status === 404 ? 4404 : 4403, error: err.message };
+    }
+    return { success: false, code: 4500, error: 'Authorization verification failed' };
+  }
 }
 
 /**
@@ -495,6 +719,133 @@ function pickColor(identifier: string): string {
   return COLLAB_COLORS[idx];
 }
 
+const MULTI_TENANT_SUFFIXES = [
+  'vercel.app',
+  'onrender.com',
+  'railway.app',
+  'fly.dev',
+  'pages.dev',
+  'github.io',
+  'netlify.app',
+  'herokuapp.com',
+];
+
+/**
+ * Checks if a wildcard pattern safely restricts multi-tenant subdomains.
+ * Prohibits bare wildcards like `*.vercel.app` because any tenant can create an account there.
+ * Allows project-prefixed patterns like `collabspace-*.vercel.app`.
+ */
+export function isWildcardPatternSafe(pattern: string): boolean {
+  const lower = pattern.toLowerCase();
+  for (const suffix of MULTI_TENANT_SUFFIXES) {
+    if (
+      lower === `*.${suffix}` ||
+      lower === `*${suffix}` ||
+      lower === `https://*.${suffix}` ||
+      lower === `http://*.${suffix}`
+    ) {
+      return false; // Dangerous: bare multi-tenant wildcard
+    }
+  }
+  return true;
+}
+
+/**
+ * Converts a wildcard pattern like "collabspace-*.vercel.app" or "*.mycompany.com" into a RegExp.
+ */
+function wildcardToRegExp(pattern: string): RegExp | null {
+  try {
+    const cleanPattern = pattern.replace(/^https?:\/\//i, '').toLowerCase();
+    // Escape regex special characters except *
+    const escaped = cleanPattern.replace(/[.+?^${}()|[\]\\-]/g, '\\$&');
+    const regexStr = '^' + escaped.replace(/\*/g, '[a-z0-9_-]+') + '$';
+    return new RegExp(regexStr);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Evaluates whether an incoming HTTP/WebSocket Origin header is permitted.
+ * Hardened for Phase 7D-V2.2:
+ * - Exact production origin matching by default (NEXT_PUBLIC_APP_URL)
+ * - Explicitly configured trusted origins in ALLOWED_ORIGINS
+ * - Rejects insecure bare multi-tenant wildcards (*.vercel.app, *.onrender.com)
+ * - Permits project-scoped wildcards (collabspace-*.vercel.app)
+ * - Rejects malformed origins safely
+ * - Restricts localhost to non-production environments unless explicitly listed
+ * - Permits missing Origin (non-browser CLI/tools) while mandatory ticket auth protects access
+ */
+export function isOriginAllowed(origin: string | undefined): boolean {
+  if (!origin) return true;
+  if (process.env.NODE_ENV !== 'production') return true;
+
+  try {
+    const originUrl = new URL(origin);
+    const requestHost = originUrl.host.toLowerCase();
+    const requestHostname = originUrl.hostname.toLowerCase();
+
+    const isLocalhost = requestHostname === 'localhost' || requestHostname === '127.0.0.1';
+
+    // Build list of configured allowed origins
+    const allowedEntries: string[] = [];
+    if (process.env.ALLOWED_ORIGINS) {
+      allowedEntries.push(...process.env.ALLOWED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean));
+    }
+    if (process.env.NEXT_PUBLIC_APP_URL) {
+      allowedEntries.push(...process.env.NEXT_PUBLIC_APP_URL.split(',').map((s) => s.trim()).filter(Boolean));
+    }
+    if (allowedEntries.length === 0) {
+      // In production without configuration, reject external connections
+      return false;
+    }
+
+    for (const rawEntry of allowedEntries) {
+      if (rawEntry === '*') return true;
+
+      let entryHost = rawEntry.toLowerCase();
+      let entryHostname = entryHost;
+
+      try {
+        const parsed = entryHost.includes('://') ? new URL(entryHost) : new URL(`https://${entryHost}`);
+        entryHost = parsed.host;
+        entryHostname = parsed.hostname;
+      } catch {
+        // Fall back to raw string if not a standard URL
+      }
+
+      // Check wildcard prefix
+      if (entryHostname.includes('*')) {
+        // Disallow bare multi-tenant wildcards
+        if (!isWildcardPatternSafe(entryHostname)) {
+          console.warn(`[CollabServer Security] Prohibited insecure bare wildcard origin: ${entryHostname}`);
+          continue;
+        }
+
+        const regex = wildcardToRegExp(entryHostname);
+        if (regex && (regex.test(requestHost) || regex.test(requestHostname))) {
+          return true;
+        }
+        continue;
+      }
+
+      // Direct host or hostname match
+      if (entryHost === requestHost || entryHostname === requestHostname) {
+        return true;
+      }
+
+      // Localhost match only if explicitly configured
+      if (isLocalhost && (entryHostname === 'localhost' || entryHostname === '127.0.0.1')) {
+        return true;
+      }
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Creates the production WebSocket Collaboration Server.
  */
@@ -512,8 +863,6 @@ export function createCollabServer(server?: http.Server, customInstanceId?: stri
     server: server,
     maxPayload: MAX_MESSAGE_SIZE,
   });
-
-  const connectionContexts = new WeakMap<WebSocket, ClientContext>();
 
   wss.on('connection', async (conn: WebSocket, req: http.IncomingMessage) => {
     // -------------------------------------------------------------
@@ -545,28 +894,279 @@ export function createCollabServer(server?: http.Server, customInstanceId?: stri
     // Security Layer: Origin Verification
     // -------------------------------------------------------------
     const origin = req.headers.origin;
-    if (origin && process.env.NODE_ENV === 'production') {
-      const allowedAppUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
-      const allowedHost = new URL(allowedAppUrl).host;
-      const requestHost = new URL(origin).host;
-      const isLocalhostMatch =
-        (allowedHost.startsWith('localhost') || allowedHost.startsWith('127.0.0.1')) &&
-        (requestHost.startsWith('localhost') || requestHost.startsWith('127.0.0.1'));
-
-      if (allowedHost !== requestHost && !isLocalhostMatch) {
-        conn.off('message', earlyBufferHandler);
-        return rejectConnection(conn, 4403, 'Untrusted origin');
-      }
+    if (origin && !isOriginAllowed(origin)) {
+      conn.off('message', earlyBufferHandler);
+      return rejectConnection(conn, 4403, 'Untrusted origin');
     }
 
-    // -------------------------------------------------------------
-    // Security Layer: Authentication & Authorization
-    // -------------------------------------------------------------
-    let context: ClientContext;
+    // Helper to complete initialization once authentication and authorization succeed
+    const setupAuthenticatedSession = async (
+      context: ClientContext,
+      earlyMessages: (ArrayBuffer | Buffer)[]
+    ) => {
+      activeConnections.add(conn);
+      connectionContexts.set(conn, context);
 
+      // Retrieve or initialize the Y.Doc room
+      const doc = await getOrCreateDoc(docId);
+      doc.conns.set(conn, new Set());
+
+      // -------------------------------------------------------------
+      // Initial Handshake: SyncStep1 + Full Document State
+      // -------------------------------------------------------------
+      {
+        const encoder = encoding.createEncoder();
+        encoding.writeVarUint(encoder, messageSync);
+        syncProtocol.writeSyncStep1(encoder, doc);
+        send(conn, encoding.toUint8Array(encoder));
+
+        const awarenessStates = doc.awareness.getStates();
+        if (awarenessStates.size > 0) {
+          const awarenessEncoder = encoding.createEncoder();
+          encoding.writeVarUint(awarenessEncoder, messageAwareness);
+          encoding.writeVarUint8Array(
+            awarenessEncoder,
+            awarenessProtocol.encodeAwarenessUpdate(
+              doc.awareness,
+              Array.from(awarenessStates.keys())
+            )
+          );
+          send(conn, encoding.toUint8Array(awarenessEncoder));
+        }
+      }
+
+      // -------------------------------------------------------------
+      // Message Processing & Security Enforcement
+      // -------------------------------------------------------------
+      const handleMessage = async (message: ArrayBuffer | Buffer) => {
+        try {
+          // Wire-level rate limiting: max 150 messages/sec per socket connection
+          const now = Date.now();
+          if (now - context.messageWindowStart > 1000) {
+            context.messageWindowStart = now;
+            context.messageCount = 1;
+          } else {
+            context.messageCount++;
+            if (context.messageCount > 150) {
+              console.warn(`[CollabServer] Rate limit exceeded by client: ${context.userId}`);
+              return;
+            }
+          }
+          const uint8Msg = new Uint8Array(message);
+          const decoder = decoding.createDecoder(uint8Msg);
+          const msgType = decoding.readVarUint(decoder);
+
+          switch (msgType) {
+            case messageSync: {
+              const encoder = encoding.createEncoder();
+              encoding.writeVarUint(encoder, messageSync);
+
+              // Read the sync message sub-type
+              const subDecoder = decoding.clone(decoder);
+              const syncSubtype = decoding.readVarUint(subDecoder);
+
+              // SECURITY ENFORCEMENT: Block write mutations from read-only viewers and commenters
+              if (
+                !context.canWrite &&
+                (syncSubtype === syncProtocol.messageYjsUpdate ||
+                  syncSubtype === syncProtocol.messageYjsSyncStep2)
+              ) {
+                console.warn(
+                  `[CollabServer] Blocked unauthorized edit mutation from non-editor client (${context.role}): ${context.userId}`
+                );
+                const authEncoder = encoding.createEncoder();
+                encoding.writeVarUint(authEncoder, messageAuth);
+                authProtocol.writePermissionDenied(
+                  authEncoder,
+                  'Permission denied: document is read-only'
+                );
+                send(conn, encoding.toUint8Array(authEncoder));
+                return;
+              }
+
+              // Normal processing for authorized clients or non-mutating sync requests
+              if (
+                syncSubtype === syncProtocol.messageYjsUpdate ||
+                syncSubtype === syncProtocol.messageYjsSyncStep2
+              ) {
+                doc.lastAuthorId = context.userId;
+              }
+              syncProtocol.readSyncMessage(decoder, encoder, doc, conn);
+
+              if (encoding.length(encoder) > 1) {
+                send(conn, encoding.toUint8Array(encoder));
+              }
+              break;
+            }
+
+            case messageAwareness: {
+              // Apply ephemeral presence updates (cursors, selections)
+              const awarenessUpdate = decoding.readVarUint8Array(decoder);
+              awarenessProtocol.applyAwarenessUpdate(doc.awareness, awarenessUpdate, conn);
+
+              // Track client IDs owned by this connection for reliable disconnect cleanup
+              const parsedAwareness = decoding.createDecoder(awarenessUpdate);
+              const clientsLength = decoding.readVarUint(parsedAwareness);
+              for (let i = 0; i < clientsLength; i++) {
+                const clientID = decoding.readVarUint(parsedAwareness);
+                decoding.readVarUint(parsedAwareness); // clock
+                decoding.readVarString(parsedAwareness); // json state
+                context.controlledUserIds.add(clientID);
+                const registered = doc.conns.get(conn);
+                if (registered) registered.add(clientID);
+              }
+              break;
+            }
+
+            case messageAuth: {
+              // Valid authenticated connection sent an in-band auth packet (e.g. ticket renewal / reauthorization)
+              try {
+                const rawTicket = decoding.readVarString(decoder);
+                if (rawTicket) {
+                  const reauthResult = await authenticateClient(rawTicket, docId, { isRefresh: true });
+                  if (!reauthResult.success) {
+                    console.warn(
+                      `[CollabServer] In-band reauthorization rejected for user ${context.userId}: ${reauthResult.error}`
+                    );
+                    rejectConnection(conn, reauthResult.code, reauthResult.error);
+                    return;
+                  }
+
+                  // SECURITY ENFORCEMENT (Finding V31-03):
+                  // In-band renewal must strictly match the authenticated connection's existing user identity.
+                  // Rejects any attempt to swap identities, escalate privileges across users, or replay tickets.
+                  if (reauthResult.user.id !== context.userId) {
+                    console.warn(
+                      `[CollabServer Security] In-band renewal user identity mismatch: connection user ${context.userId} vs ticket user ${reauthResult.user.id}`
+                    );
+                    rejectConnection(
+                      conn,
+                      4403,
+                      'Forbidden: In-band renewal ticket does not match authenticated connection user'
+                    );
+                    return;
+                  }
+
+                  context.role = reauthResult.role as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer';
+                  context.canWrite = reauthResult.canWrite;
+
+                  if (!context.canWrite) {
+                    const authEncoder = encoding.createEncoder();
+                    encoding.writeVarUint(authEncoder, messageAuth);
+                    authProtocol.writePermissionDenied(
+                      authEncoder,
+                      'Permission updated: document is now read-only'
+                    );
+                    send(conn, encoding.toUint8Array(authEncoder));
+                  }
+                  console.log(
+                    `[CollabServer] Reauthorized active connection for ${context.userId} on ${docId} (role: ${context.role})`
+                  );
+                }
+              } catch (reauthErr) {
+                console.warn('[CollabServer] Error during in-band reauthorization:', reauthErr);
+              }
+              break;
+            }
+
+            default:
+              console.warn(`[CollabServer] Unknown message type received: ${msgType}`);
+          }
+        } catch (err) {
+          console.error('[CollabServer] Error processing message:', err);
+        }
+      };
+
+      conn.on('message', handleMessage);
+
+      // Drain buffered early messages that arrived during async authorization/hydration
+      isInitialized = true;
+      for (const earlyMsg of earlyMessages) {
+        handleMessage(earlyMsg);
+      }
+
+      // Keepalive ping/pong
+      conn.on('pong', () => {
+        const ctx = connectionContexts.get(conn);
+        if (ctx) ctx.isAlive = true;
+      });
+
+      // Bounded periodic revalidation (every 60s) to catch DB-level user deletion or permission revocation
+      if (!docId.startsWith('doc-') && docId !== 'demo' && docId !== 'collabspace-demo') {
+        context.revalidationTimer = setInterval(async () => {
+          if (context.isClosed || conn.readyState !== WebSocket.OPEN) {
+            if (context.revalidationTimer) {
+              clearInterval(context.revalidationTimer);
+              context.revalidationTimer = null;
+            }
+            return;
+          }
+          try {
+            const user = await prisma.user.findUnique({
+              where: { id: context.userId },
+              select: { id: true },
+            });
+            if (!user) {
+              if (context.revalidationTimer) clearInterval(context.revalidationTimer);
+              return rejectConnection(conn, 4401, 'User account no longer active');
+            }
+            const { userRole } = await verifyDocumentAccess(context.userId, context.docId, 'viewer');
+            const canWrite = userRole === 'owner' || userRole === 'admin' || userRole === 'editor';
+            if (context.canWrite !== canWrite || context.role !== userRole) {
+              context.role = userRole;
+              context.canWrite = canWrite;
+              if (!canWrite) {
+                const authEncoder = encoding.createEncoder();
+                encoding.writeVarUint(authEncoder, messageAuth);
+                authProtocol.writePermissionDenied(
+                  authEncoder,
+                  'Permission revoked: document is now read-only'
+                );
+                send(conn, encoding.toUint8Array(authEncoder));
+              }
+            }
+          } catch {
+            if (context.revalidationTimer) clearInterval(context.revalidationTimer);
+            rejectConnection(conn, 4403, 'Document access revoked');
+          }
+        }, 60000);
+      }
+
+      // Cleanup on disconnect
+      conn.on('close', async () => {
+        if (context.isClosed) return;
+        context.isClosed = true;
+
+        if (context.revalidationTimer) {
+          clearInterval(context.revalidationTimer);
+          context.revalidationTimer = null;
+        }
+        activeConnections.delete(conn);
+
+        const controlledIds = Array.from(context.controlledUserIds);
+        if (controlledIds.length > 0) {
+          awarenessProtocol.removeAwarenessStates(doc.awareness, controlledIds, 'disconnect');
+        }
+
+        doc.conns.delete(conn);
+
+        // If all clients left, flush any unsaved state immediately
+        if (doc.conns.size === 0) {
+          if (doc.isDirty) {
+            await persistDocument(doc);
+          }
+        }
+      });
+    };
+
+    // -------------------------------------------------------------
+    // Security Layer: Authentication & Authorization Flow
+    // -------------------------------------------------------------
     if (docId.startsWith('doc-') || docId === 'demo') {
       // Demo Document Fast-Path for public exploration
-      context = {
+      conn.off('message', earlyBufferHandler);
+      const demoContext: ClientContext = {
+        connectionId: 'demo-' + Math.random().toString(36).substring(2, 10),
         docId,
         userId: `demo-user-${Date.now().toString(36)}`,
         userName: 'Demo Collaborator',
@@ -579,187 +1179,109 @@ export function createCollabServer(server?: http.Server, customInstanceId?: stri
         messageCount: 0,
         messageWindowStart: Date.now(),
       };
-    } else {
-      // Production Document: Strict Authentication & Workspace Authorization
-      const rawToken = extractAuthToken(req, parsedUrl);
-      if (!rawToken) {
-        conn.off('message', earlyBufferHandler);
-        return rejectConnection(conn, 4401, 'Unauthorized: Missing session token');
-      }
-
-      const user = await validateSessionToken(rawToken);
-      if (!user) {
-        conn.off('message', earlyBufferHandler);
-        return rejectConnection(conn, 4401, 'Unauthorized: Invalid or expired session');
-      }
-
-      try {
-        const { userRole } = await verifyDocumentAccess(user.id, docId, 'viewer');
-        const canWrite = userRole === 'owner' || userRole === 'admin' || userRole === 'editor';
-
-        context = {
-          docId,
-          userId: user.id,
-          userName: user.name,
-          userEmail: user.email,
-          userColor: pickColor(user.id),
-          role: userRole as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer',
-          canWrite,
-          controlledUserIds: new Set(),
-          isAlive: true,
-          messageCount: 0,
-          messageWindowStart: Date.now(),
-        };
-      } catch (err) {
-        conn.off('message', earlyBufferHandler);
-        if (err instanceof AuthError) {
-          return rejectConnection(conn, err.status === 404 ? 4404 : 4403, err.message);
-        }
-        return rejectConnection(conn, 4500, 'Authorization verification failed');
-      }
+      await setupAuthenticatedSession(demoContext, earlyMessageBuffer);
+      return;
     }
 
-    connectionContexts.set(conn, context);
+    // Check if credentials were provided via query parameters (e.g. ?ticket= or ?token=)
+    const queryToken = extractAuthToken(req, parsedUrl);
+    if (queryToken) {
+      const authResult = await authenticateClient(queryToken, docId);
+      conn.off('message', earlyBufferHandler);
 
-    // Retrieve or initialize the Y.Doc room
-    const doc = await getOrCreateDoc(docId);
-    doc.conns.set(conn, new Set());
+      if (!authResult.success) {
+        return rejectConnection(conn, authResult.code, authResult.error);
+      }
 
-    // -------------------------------------------------------------
-    // Initial Handshake: SyncStep1 + Full Document State
-    // -------------------------------------------------------------
-    {
-      const encoder = encoding.createEncoder();
-      encoding.writeVarUint(encoder, messageSync);
-      syncProtocol.writeSyncStep1(encoder, doc);
-      send(conn, encoding.toUint8Array(encoder));
+      const context: ClientContext = {
+        connectionId: 'conn-' + Math.random().toString(36).substring(2, 10),
+        docId,
+        userId: authResult.user.id,
+        userName: authResult.user.name,
+        userEmail: authResult.user.email,
+        userColor: pickColor(authResult.user.id),
+        role: authResult.role as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer',
+        canWrite: authResult.canWrite,
+        controlledUserIds: new Set(),
+        isAlive: true,
+        messageCount: 0,
+        messageWindowStart: Date.now(),
+      };
 
-      const awarenessStates = doc.awareness.getStates();
-      if (awarenessStates.size > 0) {
-        const awarenessEncoder = encoding.createEncoder();
-        encoding.writeVarUint(awarenessEncoder, messageAwareness);
-        encoding.writeVarUint8Array(
-          awarenessEncoder,
-          awarenessProtocol.encodeAwarenessUpdate(
-            doc.awareness,
-            Array.from(awarenessStates.keys())
-          )
+      await setupAuthenticatedSession(context, earlyMessageBuffer);
+      return;
+    }
+
+    // In-Band Ticket Authentication Mode:
+    // No token in URL query params. Connection is held pending in-band ticket verification.
+    // Client must transmit a signed HMAC-SHA256 ticket as its very first message.
+    let isPendingAuth = true;
+    let isSocketClosed = false;
+
+    const authTimeout = setTimeout(() => {
+      if (isPendingAuth && !isSocketClosed) {
+        isPendingAuth = false;
+        conn.off('message', earlyBufferHandler);
+        conn.off('message', initialAuthHandler);
+        rejectConnection(conn, 4401, 'Unauthorized: Missing session token');
+      }
+    }, 2000);
+
+    conn.on('close', () => {
+      isSocketClosed = true;
+      clearTimeout(authTimeout);
+    });
+
+    const initialAuthHandler = async (msg: ArrayBuffer | Buffer) => {
+      if (!isPendingAuth || isSocketClosed) return;
+
+      const ticket = parseAuthPacket(msg);
+      if (!ticket) {
+        // A non-auth message was received before authenticating!
+        isPendingAuth = false;
+        clearTimeout(authTimeout);
+        conn.off('message', earlyBufferHandler);
+        conn.off('message', initialAuthHandler);
+        return rejectConnection(
+          conn,
+          4401,
+          'Unauthorized: Authentication required before protocol sync'
         );
-        send(conn, encoding.toUint8Array(awarenessEncoder));
       }
-    }
 
-    // -------------------------------------------------------------
-    // Message Processing & Security Enforcement
-    // -------------------------------------------------------------
-    conn.off('message', earlyBufferHandler);
+      // Ticket received: consume and validate
+      isPendingAuth = false;
+      clearTimeout(authTimeout);
+      conn.off('message', initialAuthHandler);
 
-    const handleMessage = (message: ArrayBuffer | Buffer) => {
-      try {
-        // Wire-level rate limiting: max 150 messages/sec per socket connection
-        const now = Date.now();
-        if (now - context.messageWindowStart > 1000) {
-          context.messageWindowStart = now;
-          context.messageCount = 1;
-        } else {
-          context.messageCount++;
-          if (context.messageCount > 150) {
-            console.warn(`[CollabServer] Rate limit exceeded by client: ${context.userId}`);
-            return;
-          }
-        }
-        const uint8Msg = new Uint8Array(message);
-        const decoder = decoding.createDecoder(uint8Msg);
-        const msgType = decoding.readVarUint(decoder);
+      const authResult = await authenticateClient(ticket, docId);
+      conn.off('message', earlyBufferHandler);
 
-        switch (msgType) {
-          case messageSync: {
-            const encoder = encoding.createEncoder();
-            encoding.writeVarUint(encoder, messageSync);
-
-            // Read the sync message sub-type
-            const subDecoder = decoding.clone(decoder);
-            const syncSubtype = decoding.readVarUint(subDecoder);
-
-            // SECURITY ENFORCEMENT: Block write mutations from read-only viewers and commenters
-            if (!context.canWrite && (syncSubtype === syncProtocol.messageYjsUpdate || syncSubtype === syncProtocol.messageYjsSyncStep2)) {
-              console.warn(`[CollabServer] Blocked unauthorized edit mutation from non-editor client (${context.role}): ${context.userId}`);
-              const authEncoder = encoding.createEncoder();
-              encoding.writeVarUint(authEncoder, messageAuth);
-              authProtocol.writePermissionDenied(authEncoder, 'Permission denied: document is read-only');
-              send(conn, encoding.toUint8Array(authEncoder));
-              return;
-            }
-
-            // Normal processing for authorized clients or non-mutating sync requests
-            if (syncSubtype === syncProtocol.messageYjsUpdate || syncSubtype === syncProtocol.messageYjsSyncStep2) {
-              doc.lastAuthorId = context.userId;
-            }
-            syncProtocol.readSyncMessage(decoder, encoder, doc, conn);
-
-            if (encoding.length(encoder) > 1) {
-              send(conn, encoding.toUint8Array(encoder));
-            }
-            break;
-          }
-
-          case messageAwareness: {
-            // Apply ephemeral presence updates (cursors, selections)
-            const awarenessUpdate = decoding.readVarUint8Array(decoder);
-            awarenessProtocol.applyAwarenessUpdate(doc.awareness, awarenessUpdate, conn);
-
-            // Track client IDs owned by this connection for reliable disconnect cleanup
-            const parsedAwareness = decoding.createDecoder(awarenessUpdate);
-            const clientsLength = decoding.readVarUint(parsedAwareness);
-            for (let i = 0; i < clientsLength; i++) {
-              const clientID = decoding.readVarUint(parsedAwareness);
-              decoding.readVarUint(parsedAwareness); // clock
-              decoding.readVarString(parsedAwareness); // json state
-              context.controlledUserIds.add(clientID);
-              const registered = doc.conns.get(conn);
-              if (registered) registered.add(clientID);
-            }
-            break;
-          }
-
-          default:
-            console.warn(`[CollabServer] Unknown message type received: ${msgType}`);
-        }
-      } catch (err) {
-        console.error('[CollabServer] Error processing message:', err);
+      if (!authResult.success) {
+        return rejectConnection(conn, authResult.code, authResult.error);
       }
+
+      const remainingEarlyMessages = earlyMessageBuffer.filter((m) => m !== msg);
+
+      const context: ClientContext = {
+        connectionId: 'conn-' + Math.random().toString(36).substring(2, 10),
+        docId,
+        userId: authResult.user.id,
+        userName: authResult.user.name,
+        userEmail: authResult.user.email,
+        userColor: pickColor(authResult.user.id),
+        role: authResult.role as 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer',
+        canWrite: authResult.canWrite,
+        controlledUserIds: new Set(),
+        isAlive: true,
+        messageCount: 0,
+        messageWindowStart: Date.now(),
+      };
+
+      await setupAuthenticatedSession(context, remainingEarlyMessages);
     };
 
-    conn.on('message', handleMessage);
-
-    // Drain buffered early messages that arrived during async authorization/hydration
-    isInitialized = true;
-    for (const earlyMsg of earlyMessageBuffer) {
-      handleMessage(earlyMsg);
-    }
-
-    // Keepalive ping/pong
-    conn.on('pong', () => {
-      const ctx = connectionContexts.get(conn);
-      if (ctx) ctx.isAlive = true;
-    });
-
-    // Cleanup on disconnect
-    conn.on('close', async () => {
-      const controlledIds = Array.from(context.controlledUserIds);
-      if (controlledIds.length > 0) {
-        awarenessProtocol.removeAwarenessStates(doc.awareness, controlledIds, 'disconnect');
-      }
-
-      doc.conns.delete(conn);
-
-      // If all clients left, flush any unsaved state immediately
-      if (doc.conns.size === 0) {
-        if (doc.isDirty) {
-          await persistDocument(doc);
-        }
-      }
-    });
+    conn.on('message', initialAuthHandler);
   });
 
   // Heartbeat interval to terminate stale connections
@@ -780,9 +1302,27 @@ export function createCollabServer(server?: http.Server, customInstanceId?: stri
   const close = async () => {
     clearInterval(heartbeatInterval);
 
+    // Clear active revalidation timers
+    activeConnections.forEach((conn) => {
+      const ctx = connectionContexts.get(conn);
+      if (ctx?.revalidationTimer) {
+        clearInterval(ctx.revalidationTimer);
+        ctx.revalidationTimer = null;
+      }
+    });
+    activeConnections.clear();
+
     // Flush all active document states to PostgreSQL
     const flushPromises = Array.from(docs.values()).map((doc) => persistDocument(doc));
     await Promise.all(flushPromises);
+
+    Array.from(docs.values()).forEach((doc) => {
+      if (doc.saveTimeout) {
+        clearTimeout(doc.saveTimeout);
+        doc.saveTimeout = null;
+      }
+    });
+    docs.clear();
 
     // Close Redis connections
     if (redisPub) {
@@ -793,6 +1333,13 @@ export function createCollabServer(server?: http.Server, customInstanceId?: stri
       await redisSub.quit().catch(() => {});
       redisSub = null;
     }
+
+    // Close active clients
+    wss.clients.forEach((client) => {
+      try {
+        client.terminate();
+      } catch {}
+    });
 
     return new Promise<void>((resolve) => {
       wss.close(() => resolve());
@@ -810,7 +1357,10 @@ if (require.main === module) {
 
   const server = http.createServer((req, res) => {
     if (req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      });
       res.end(JSON.stringify({ status: 'ok', activeDocuments: docs.size, timestamp: new Date().toISOString() }));
       return;
     }

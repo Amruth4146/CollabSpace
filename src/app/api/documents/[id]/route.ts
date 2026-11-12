@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server';
-import { cookies } from 'next/headers';
 import { requireAuthUser, verifyDocumentAccess, verifyWorkspaceAccess, AuthError } from '@/lib/auth/authorization';
 import { prisma } from '@/lib/prisma';
 import { sanitizeHtml } from '@/lib/sanitize';
-import { SESSION_COOKIE_NAME } from '@/lib/auth/session';
+import { createCollabTicket } from '@/lib/auth/collab-ticket';
+import { publishRevocationEvent } from '@/lib/redis';
 import { z } from 'zod';
 
 const updateDocSchema = z.object({
@@ -44,9 +44,6 @@ export async function GET(
       return NextResponse.json({ error: 'Document not found.' }, { status: 404 });
     }
 
-    const cookieStore = await cookies();
-    const sessionToken = cookieStore.get(SESSION_COOKIE_NAME)?.value || null;
-
     return NextResponse.json({
       document: {
         id: fullDoc.id,
@@ -77,7 +74,11 @@ export async function GET(
       },
       userRole,
       permissions,
-      collabToken: sessionToken,
+      collabToken: createCollabTicket({
+        userId: user.id,
+        documentId,
+        role: userRole,
+      }),
       currentUser: {
         id: user.id,
         name: user.name,
@@ -89,6 +90,7 @@ export async function GET(
     if (error instanceof AuthError) {
       return NextResponse.json({ error: error.message }, { status: error.status });
     }
+    console.error('[API/documents/[id]] Error fetching document:', error);
     return NextResponse.json({ error: 'Failed to fetch document.' }, { status: 500 });
   }
 }
@@ -164,6 +166,12 @@ export async function PATCH(
       },
     });
 
+    // Real-Time Revocation (Finding V31-04):
+    // If document was soft-deleted or moved to another workspace, immediately revoke active WebSocket connections
+    if (isDeleted === true || (targetWorkspaceId && targetWorkspaceId !== document.workspaceId)) {
+      publishRevocationEvent({ action: 'revoke_doc', docId: documentId }).catch(() => {});
+    }
+
     return NextResponse.json({
       success: true,
       document: {
@@ -216,6 +224,9 @@ export async function DELETE(
     await prisma.document.delete({
       where: { id: documentId },
     });
+
+    // Notify all active WebSocket servers to close connections to this deleted document
+    publishRevocationEvent({ action: 'revoke_doc', docId: documentId }).catch(() => {});
 
     return NextResponse.json({ success: true, message: 'Document permanently deleted.' });
   } catch (error) {

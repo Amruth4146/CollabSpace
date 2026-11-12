@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { requireAuthUser, verifyWorkspaceAccess, AuthError } from '@/lib/auth/authorization';
 import { prisma } from '@/lib/prisma';
+import { publishRevocationEvent } from '@/lib/redis';
 import { z } from 'zod';
 
 const updateRoleSchema = z.object({
@@ -62,6 +63,13 @@ export async function PATCH(
       },
     });
 
+    // Notify all active WebSocket servers about the member role change
+    publishRevocationEvent({
+      action: 'role_change',
+      userId: targetMember.userId,
+      newRole: parseResult.data.role,
+    }).catch(() => {});
+
     return NextResponse.json({ success: true, member: updatedMember });
   } catch (error) {
     if (error instanceof AuthError) {
@@ -104,6 +112,8 @@ export async function DELETE(
         where: { id: memberId },
       });
 
+      publishRevocationEvent({ action: 'revoke_user', userId: targetMember.userId }).catch(() => {});
+
       return NextResponse.json({ success: true, message: 'You have left the workspace.' });
     }
 
@@ -129,6 +139,8 @@ export async function DELETE(
     await prisma.workspaceMember.delete({
       where: { id: memberId },
     });
+
+    publishRevocationEvent({ action: 'revoke_user', userId: targetMember.userId }).catch(() => {});
 
     return NextResponse.json({ success: true, message: 'Member removed from workspace.' });
   } catch (error) {

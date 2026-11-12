@@ -15,11 +15,15 @@ import { prisma } from './prisma';
 let sharedRedisClient: Redis | null = null;
 
 export function getRedisConfig(): RedisOptions {
+  const redisUrl = process.env.REDIS_URL || '';
+  const isTls = redisUrl.startsWith('rediss://');
+
   return {
     lazyConnect: true,
     maxRetriesPerRequest: 2,
     enableReadyCheck: true,
     connectTimeout: 5000,
+    ...(isTls ? { tls: {} } : {}),
     retryStrategy(times) {
       if (times > 10) {
         console.warn('[Redis] Max reconnection attempts reached; slowing retry cadence.');
@@ -216,6 +220,32 @@ export async function releaseDistributedLock(
     return result === 1;
   } catch (err) {
     console.warn(`[Redis Lock] Error releasing lock ${lockKey}:`, err);
+    return false;
+  }
+}
+
+export interface RevocationEvent {
+  action: 'revoke_user' | 'revoke_doc' | 'role_change' | 'revoke_session';
+  userId?: string;
+  docId?: string;
+  newRole?: 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer';
+  timestamp?: number;
+}
+
+/**
+ * Publishes a real-time permission or session revocation event across all WebSocket server instances.
+ */
+export async function publishRevocationEvent(event: RevocationEvent): Promise<boolean> {
+  try {
+    const client = getRedisClient();
+    const payload = JSON.stringify({
+      ...event,
+      timestamp: event.timestamp || Date.now(),
+    });
+    await client.publish('collab:revoke', payload);
+    return true;
+  } catch (err) {
+    console.warn('[Redis Revocation] Failed to publish revocation event:', (err as Error).message);
     return false;
   }
 }
